@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Cyber-Tracker HUD</title>
+<title>Cyber-Tracker HUD v2</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   
@@ -161,7 +161,7 @@ let lastImageData = null;
  * モバイルGPUへの負荷を大幅に減らせる。
  */
 let motionFrameCounter = 0;
-const MOTION_SKIP_FRAMES = 3;
+const MOTION_SKIP_FRAMES = 1; // v2: 毎フレーム検知に変更（48x48なら十分軽量）
 
 btnStart.addEventListener('click', () => {
   btnStart.innerText = "INITIALIZING...";
@@ -477,7 +477,7 @@ function drawHUD() {
   // 固定HUD情報
   ctx.fillStyle = colorPrimary;
   ctx.font = '14px monospace';
-  ctx.fillText(`SYS.VER 9.5.4 [OPTICS]`, 20, 30);
+  ctx.fillText(`SYS.VER 9.6.0 [OPTICS]`, 20, 30);
   
   const camStatus = cameraEnabled ? 'ONLINE (ENV)' : 'OFFLINE (MANUAL)';
   const motionStatus = (state.isLocked && !state.manualOverride) ? 'DETECTED' : 'STANDBY';
@@ -551,9 +551,10 @@ function animate() {
   // 2. 動体検知（フレームスキップ付き）
   updateMotionTracking();
 
-  // 3. 照準の滑らかな移動
-  state.currentX += (state.targetX - state.currentX) * 12 * delta;
-  state.currentY += (state.targetY - state.currentY) * 12 * delta;
+  // 3. 照準の滑らかな移動 — ロック時は高速追従、サーチ時はゆっくり巡回
+  const trackSpeed = state.isLocked ? 25 : 10; // v2: メリハリ追従
+  state.currentX += (state.targetX - state.currentX) * trackSpeed * delta;
+  state.currentY += (state.targetY - state.currentY) * trackSpeed * delta;
 
   // 4. 3Dオブジェクトの更新
   gridHelper.position.z = (state.time * 5) % 10;
