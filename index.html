@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Cyber-Tracker HUD</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  
+  body, canvas, div {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+    touch-action: none;
+  }
+
+  body {
+    background: #000;
+    overflow: hidden;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    color: #00ffcc;
+  }
+  
+  /*
+   * 【修正核心】video要素を実際に可視状態で背面に配置する。
+   * opacity:0.001 + z-index:-10 だとiOS Safariが省電力で映像更新を止めるため、
+   * object-fit:cover で画面全体に表示し、bg-canvasで上から覆い隠す構造に変更。
+   */
+  #camera-video {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    object-fit: cover;
+    z-index: 0;
+    pointer-events: none;
+  }
+
+  /* bg-canvasをvideoの上に重ねて映像の見え方を制御する */
+  #bg-canvas {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw; height: 100vh;
+    z-index: 1;
+    pointer-events: none;
+  }
+
+  /* 3Dレイヤー */
+  #webgl-canvas {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw; height: 100vh;
+    z-index: 2;
+    pointer-events: none;
+    mix-blend-mode: screen; 
+  }
+  
+  /* 2D HUDレイヤー */
+  #hud-canvas {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw; height: 100vh;
+    z-index: 3;
+    pointer-events: none;
+  }
+
+  .scanlines {
+    position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+    background: linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,0) 50%, rgba(0, 255, 200, 0.05) 50%, rgba(0, 255, 200, 0.05));
+    background-size: 100% 4px;
+    z-index: 10; pointer-events: none; opacity: 0.6;
+  }
+
+  #start-screen {
+    position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+    background: #000; z-index: 100;
+    display: flex; flex-direction: column; justify-content: center; align-items: center;
+    transition: opacity 0.5s ease;
+  }
+  .sys-title {
+    font-size: 1.5rem; letter-spacing: 0.3em; margin-bottom: 30px;
+    text-shadow: 0 0 10px #00ffcc; text-align: center;
+  }
+  #btn-start {
+    padding: 15px 30px; border: 1px solid #00ffcc;
+    background: rgba(0, 255, 204, 0.1); color: #00ffcc;
+    font-family: inherit; font-size: 1.1rem; cursor: pointer;
+    text-transform: uppercase; letter-spacing: 0.1em;
+    box-shadow: 0 0 15px rgba(0, 255, 204, 0.2);
+  }
+  #btn-start:active { background: rgba(0, 255, 204, 0.4); }
+</style>
+</head>
+<body>
+
+<video id="camera-video" autoplay playsinline webkit-playsinline muted></video>
+
+<canvas id="bg-canvas"></canvas>
+<canvas id="webgl-canvas"></canvas>
+<canvas id="hud-canvas"></canvas>
+<div class="scanlines"></div>
+
+<div id="start-screen">
+  <div class="sys-title">OPTICS SYSTEM<br><span style="font-size: 0.8rem; opacity: 0.7;">AWAITING ACTIVATION</span></div>
+  <button id="btn-start">ACTIVATE CAMERA</button>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+// ============================================================
+// 1. 基本設定（状態管理）
+// ============================================================
+const state = {
+  targetX: window.innerWidth / 2,
+  targetY: window.innerHeight / 2,
+  currentX: window.innerWidth / 2,
+  currentY: window.innerHeight / 2,
+  isLocked: false,
+  manualOverride: false,
+  time: 0
+};
+
+// ============================================================
+// 2. Webカメラのセットアップ & 動体検知
+// ============================================================
+const video = document.getElementById('camera-video');
+const startScreen = document.getElementById('start-screen');
+const btnStart = document.getElementById('btn-start');
+let cameraEnabled = false;
+
+const motionCanvas = document.createElement('canvas');
+const motionCtx = motionCanvas.getContext('2d', { willReadFrequently: true });
+
+/*
+ * 【修正】MOTION_RES を 48 に下げてモバイル負荷を軽減。
+ * 64x64 = 4096px の差分計算は毎フレームだと重い端末がある。
+ * 48x48 = 2304px で十分な検知精度を維持できる。
+ */
+const MOTION_RES = 48;
+motionCanvas.width = MOTION_RES;
+motionCanvas.height = MOTION_RES;
+let lastImageData = null;
+
+/*
+ * 【修正】動体検知のフレームスキップ。
+ * 毎フレーム差分計算ではなく、3フレームに1回に間引く。
+ * モバイルGPUへの負荷を大幅に減らせる。
+ */
+let motionFrameCounter = 0;
+const MOTION_SKIP_FRAMES = 3;
+
+btnStart.addEventListener('click', () => {
+  btnStart.innerText = "INITIALIZING...";
+  
+  /*
+   * 【修正】カメラ解像度をモバイル向けに制限。
+   * 高解像度を要求するとiOSでフリーズすることがある。
+   * HUD用途では640x480で十分。
+   */
+  const videoConstraints = {
+    facingMode: 'environment',
+    width: { ideal: 640 },
+    height: { ideal: 480 }
+  };
+  
+  navigator.mediaDevices.getUserMedia({
+    video: videoConstraints,
+    audio: false
+  }).then(stream => {
+    video.srcObject = stream;
+    video.play().catch(e => console.warn("Auto-play prevented:", e));
+    
+    let timeout = setTimeout(() => {
+      clearInterval(checkInterval);
+      btnStart.innerText = "CAMERA TIMEOUT";
+      setTimeout(() => {
+        startScreen.style.opacity = '0';
+        setTimeout(() => startScreen.style.display = 'none', 500);
+      }, 1500);
+    }, 5000);
+
+    let checkInterval = setInterval(() => {
+      if (video.readyState >= 2) {
+        clearInterval(checkInterval);
+        clearTimeout(timeout);
+        cameraEnabled = true;
+        startScreen.style.opacity = '0';
+        setTimeout(() => startScreen.style.display = 'none', 500);
+      }
+    }, 100);
+
+  }).catch(err => {
+    console.warn("背面カメラ失敗。フロントカメラを試します。", err);
+    navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false
+    }).then(stream => {
+        video.srcObject = stream;
+        video.play().catch(e => console.warn(e));
+        
+        let timeout = setTimeout(() => {
+          clearInterval(checkInterval);
+          btnStart.innerText = "CAMERA TIMEOUT";
+          setTimeout(() => { startScreen.style.display = 'none'; }, 1500);
+        }, 5000);
+
+        let checkInterval = setInterval(() => {
+          if (video.readyState >= 2) {
+            clearInterval(checkInterval);
+            clearTimeout(timeout);
+            cameraEnabled = true;
+            startScreen.style.opacity = '0';
+            setTimeout(() => startScreen.style.display = 'none', 500);
+          }
+        }, 100);
+      }).catch(fallbackErr => {
+        btnStart.innerText = "CAMERA OFFLINE";
+        setTimeout(() => {
+          startScreen.style.opacity = '0';
+          setTimeout(() => startScreen.style.display = 'none', 500);
+        }, 1500);
+      });
+  });
+});
+
+function getScreenPosFromVideoPos(videoU, videoV) {
+  const videoAspect = video.videoWidth / video.videoHeight;
+  const screenAspect = window.innerWidth / window.innerHeight;
+  
+  let drawWidth, drawHeight, drawX, drawY;
+  if (screenAspect > videoAspect) {
+    drawWidth = window.innerWidth;
+    drawHeight = window.innerWidth / videoAspect;
+    drawX = 0;
+    drawY = (window.innerHeight - drawHeight) / 2;
+  } else {
+    drawHeight = window.innerHeight;
+    drawWidth = window.innerHeight * videoAspect;
+    drawX = (window.innerWidth - drawWidth) / 2;
+    drawY = 0;
+  }
+  return {
+    x: drawX + videoU * drawWidth,
+    y: drawY + videoV * drawHeight
+  };
+}
+
+function updateMotionTracking() {
+  if (!cameraEnabled || video.readyState < video.HAVE_CURRENT_DATA) return;
+  if (state.manualOverride) return;
+  
+  /* 【修正】フレームスキップ */
+  motionFrameCounter++;
+  if (motionFrameCounter % MOTION_SKIP_FRAMES !== 0) return;
+  
+  motionCtx.drawImage(video, 0, 0, MOTION_RES, MOTION_RES);
+  const currentImageData = motionCtx.getImageData(0, 0, MOTION_RES, MOTION_RES);
+  const data = currentImageData.data;
+  
+  if (lastImageData) {
+    const lastData = lastImageData.data;
+    let motionX = 0, motionY = 0, motionCount = 0;
+    
+    for (let i = 0; i < data.length; i += 4) {
+      const rDiff = Math.abs(data[i] - lastData[i]);
+      const gDiff = Math.abs(data[i+1] - lastData[i+1]);
+      const bDiff = Math.abs(data[i+2] - lastData[i+2]);
+      const diff = (rDiff + gDiff + bDiff) / 3;
+      
+      /*
+       * 【修正】閾値を 35 → 45 に引き上げ。
+       * ライブカメラはセンサーノイズ・自動露出の変動で
+       * 常に微小な差分が出る。35だと誤検知が多い。
+       */
+      if (diff > 45) { 
+        const pixelIndex = i / 4;
+        const x = pixelIndex % MOTION_RES;
+        const y = Math.floor(pixelIndex / MOTION_RES);
+        motionX += x;
+        motionY += y;
+        motionCount++;
+      }
+    }
+    
+    const totalPixels = MOTION_RES * MOTION_RES;
+    
+    /*
+     * 【修正】下限を 10 → 15 に。上限を 0.25 → 0.20 に。
+     * カメラの微振動や照明変化による全体的な差分をより厳密に除外。
+     */
+    if (motionCount > 15 && motionCount < totalPixels * 0.20) {
+      const avgX = motionX / motionCount;
+      const avgY = motionY / motionCount;
+      
+      const videoU = avgX / MOTION_RES; 
+      const videoV = avgY / MOTION_RES;
+      
+      const { x, y } = getScreenPosFromVideoPos(videoU, videoV);
+      state.targetX = x;
+      state.targetY = y;
+      state.isLocked = true;
+    } else {
+      state.isLocked = false;
+    }
+  }
+  lastImageData = currentImageData;
+}
+
+
+// ============================================================
+// 3. Three.js (3D空間の描画)
+// ============================================================
+const webglCanvas = document.getElementById('webgl-canvas');
+const scene = new THREE.Scene();
+
+const camera3D = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+camera3D.position.set(0, 5, 20);
+
+const renderer = new THREE.WebGLRenderer({ canvas: webglCanvas, antialias: false, powerPreference: "high-performance", alpha: true });
+renderer.setClearColor(0x000000, 0); /* 【修正】背景を完全透明に。screen合成でvideoが透けるように */
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+
+const gridHelper = new THREE.GridHelper(200, 100, 0x00ffcc, 0x003322);
+gridHelper.position.y = -5;
+scene.add(gridHelper);
+
+const targetGroup = new THREE.Group();
+scene.add(targetGroup);
+
+const boxGeo = new THREE.BoxGeometry(2, 2, 2);
+const edgesGeo = new THREE.EdgesGeometry(boxGeo);
+const targetMat = new THREE.LineBasicMaterial({ color: 0x00ffcc, transparent: true, opacity: 0.9 });
+const targetMesh = new THREE.LineSegments(edgesGeo, targetMat);
+targetGroup.add(targetMesh);
+
+const innerBoxGeo = new THREE.BoxGeometry(1, 1, 1);
+const innerEdgesGeo = new THREE.EdgesGeometry(innerBoxGeo);
+const innerTargetMesh = new THREE.LineSegments(innerEdgesGeo, targetMat);
+targetGroup.add(innerTargetMesh);
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera3D));
+const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.2, 0.4, 0.1);
+composer.addPass(bloomPass);
+
+
+// ============================================================
+// 4. Canvas 2D (背景オーバーレイ ＆ HUD)
+// ============================================================
+const bgCanvas = document.getElementById('bg-canvas');
+const bgCtx = bgCanvas.getContext('2d', { alpha: true }); /* 【修正】alpha:trueに変更 */
+const hudCanvas = document.getElementById('hud-canvas');
+const ctx = hudCanvas.getContext('2d');
+let hudWidth = window.innerWidth;
+let hudHeight = window.innerHeight;
+
+function resizeCanvas() {
+  hudWidth = window.innerWidth;
+  hudHeight = window.innerHeight;
+  
+  const dpr = Math.min(window.devicePixelRatio, 2); /* 【修正】DPRも上限2に */
+  
+  hudCanvas.width = hudWidth * dpr;
+  hudCanvas.height = hudHeight * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  
+  bgCanvas.width = hudWidth * dpr;
+  bgCanvas.height = hudHeight * dpr;
+  bgCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  
+  renderer.setSize(hudWidth, hudHeight);
+  camera3D.aspect = hudWidth / hudHeight;
+  camera3D.updateProjectionMatrix();
+  composer.setSize(hudWidth, hudHeight);
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas(); 
+
+function getRandomHex(length) {
+  let result = '';
+  const characters = '0123456789ABCDEF';
+  for (let i = 0; i < length; i++) result += characters.charAt(Math.floor(Math.random() * characters.length));
+  return result;
+}
+
+const dataLog = [];
+for(let i=0; i<15; i++) dataLog.push(getRandomHex(12));
+
+/*
+ * 【修正】背景描画の役割変更。
+ * video要素自体が背面に可視表示されているため、
+ * bg-canvasは「暗くするオーバーレイ」としてのみ機能する。
+ * video未起動時だけ黒塗りする。
+ */
+function drawBackground() {
+  bgCtx.clearRect(0, 0, hudWidth, hudHeight);
+  if (cameraEnabled && video.readyState >= video.HAVE_CURRENT_DATA) {
+    /* videoは下のレイヤーで見えているので、半透明の黒をかぶせてHUDを見やすくする */
+    bgCtx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+    bgCtx.fillRect(0, 0, hudWidth, hudHeight);
+  } else {
+    bgCtx.fillStyle = '#000';
+    bgCtx.fillRect(0, 0, hudWidth, hudHeight);
+  }
+}
+
+function drawHUD() {
+  ctx.clearRect(0, 0, hudWidth, hudHeight);
+  const cx = state.currentX;
+  const cy = state.currentY;
+  
+  const colorPrimary = state.isLocked ? '#ff0055' : '#00ffcc';
+  const colorSecondary = state.isLocked ? 'rgba(255,0,85,0.4)' : 'rgba(0,255,204,0.4)';
+
+  ctx.strokeStyle = colorPrimary;
+  ctx.fillStyle = colorPrimary;
+  ctx.lineWidth = 1;
+  ctx.font = '10px "SFMono-Regular", Consolas, monospace';
+
+  // 接続ライン
+  const corners = [ {x: 50, y: 50}, {x: hudWidth - 50, y: 50}, {x: 50, y: hudHeight - 50}, {x: hudWidth - 50, y: hudHeight - 50} ];
+  ctx.beginPath();
+  corners.forEach(c => {
+    ctx.moveTo(c.x, c.y); ctx.lineTo(cx, cy);
+    const midX = (c.x + cx) / 2; const midY = (c.y + cy) / 2;
+    const dist = Math.hypot(cx - c.x, cy - c.y).toFixed(1);
+    ctx.save();
+    ctx.translate(midX, midY);
+    ctx.rotate(Math.atan2(cy - c.y, cx - c.x));
+    ctx.fillText(`DST:${dist}m`, 10, -5);
+    if(Math.random() > 0.5) ctx.fillText(`[${getRandomHex(4)}]`, 10, 10);
+    ctx.restore();
+  });
+  ctx.strokeStyle = colorSecondary;
+  ctx.stroke();
+
+  // メインレティクル
+  ctx.strokeStyle = colorPrimary;
+  ctx.lineWidth = 1.5;
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(state.time * 2); ctx.beginPath(); ctx.arc(0, 0, 40, 0, Math.PI * 0.4); ctx.arc(0, 0, 40, Math.PI, Math.PI * 1.4); ctx.stroke(); ctx.restore();
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(-state.time * 3); ctx.beginPath(); ctx.arc(0, 0, 25, 0, Math.PI * 0.7); ctx.arc(0, 0, 25, Math.PI, Math.PI * 1.7); ctx.stroke(); ctx.restore();
+  
+  ctx.beginPath();
+  ctx.moveTo(cx - 60, cy); ctx.lineTo(cx - 15, cy); ctx.moveTo(cx + 60, cy); ctx.lineTo(cx + 15, cy);
+  ctx.moveTo(cx, cy - 60); ctx.lineTo(cx, cy - 15); ctx.moveTo(cx, cy + 60); ctx.lineTo(cx, cy + 15);
+  ctx.stroke();
+
+  ctx.beginPath(); ctx.arc(cx, cy, 2, 0, Math.PI * 2); ctx.fill();
+
+  ctx.font = '12px monospace';
+  ctx.fillText(`TRK-X : ${cx.toFixed(2)}`, cx + 50, cy - 30);
+  ctx.fillText(`TRK-Y : ${cy.toFixed(2)}`, cx + 50, cy - 15);
+  ctx.fillText(`AZIMTH: ${(Math.atan2(cy - hudHeight/2, cx - hudWidth/2) * 180 / Math.PI).toFixed(1)}°`, cx + 50, cy + 20);
+  
+  if (state.isLocked) {
+    ctx.fillStyle = '#ff0055'; ctx.fillText(`!! TARGET LOCKED !!`, cx + 50, cy + 40);
+  } else {
+    ctx.fillStyle = colorPrimary; ctx.fillText(`STATUS: SEARCHING`, cx + 50, cy + 40);
+  }
+
+  // 固定HUD情報
+  ctx.fillStyle = colorPrimary;
+  ctx.font = '14px monospace';
+  ctx.fillText(`SYS.VER 9.5.4 [OPTICS]`, 20, 30);
+  
+  const camStatus = cameraEnabled ? 'ONLINE (ENV)' : 'OFFLINE (MANUAL)';
+  const motionStatus = (state.isLocked && !state.manualOverride) ? 'DETECTED' : 'STANDBY';
+  ctx.fillText(`OPTIC : ${camStatus}`, 20, 60);
+  ctx.fillText(`MOTION: ${motionStatus}`, 20, 80);
+
+  const rightX = hudWidth - 180;
+  ctx.fillText(`V-SYNC : OK`, rightX, 30);
+  ctx.fillText(`MEM_ADR: 0x${getRandomHex(8)}`, rightX, 50);
+  ctx.fillText(`OFFSET : ${getRandomHex(4)}-${getRandomHex(4)}`, rightX, 70);
+  
+  ctx.font = '10px monospace';
+  if (Math.random() > 0.8) { dataLog.shift(); dataLog.push(`PROC_${getRandomHex(4)}: ${getRandomHex(16)}`); }
+  for(let i=0; i<dataLog.length; i++) ctx.fillText(dataLog[i], 20, hudHeight - 150 + (i * 12));
+
+  ctx.beginPath(); ctx.arc(hudWidth - 50, hudHeight - 50, 30, 0, Math.PI * 2); ctx.strokeStyle = colorSecondary; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(hudWidth - 50, hudHeight - 50); const ang = state.time * 5; ctx.lineTo(hudWidth - 50 + Math.cos(ang)*30, hudHeight - 50 + Math.sin(ang)*30);
+  ctx.strokeStyle = colorPrimary; ctx.stroke();
+}
+
+
+// ============================================================
+// 5. 手動入力ハンドリング
+// ============================================================
+function updateManualTarget(clientX, clientY) {
+  state.targetX = clientX;
+  state.targetY = clientY;
+}
+
+window.addEventListener('touchstart', (e) => { 
+  if (e.target.tagName === 'BUTTON') return; 
+  e.preventDefault(); /* 【修正】iOS Safariのバウンス・ズームを確実に防止 */
+  state.manualOverride = true; 
+  state.isLocked = true; 
+  updateManualTarget(e.touches[0].clientX, e.touches[0].clientY); 
+}, { passive: false });
+
+window.addEventListener('touchmove', (e) => { 
+  e.preventDefault();
+  if (state.manualOverride) {
+    updateManualTarget(e.touches[0].clientX, e.touches[0].clientY); 
+  }
+}, { passive: false });
+
+window.addEventListener('touchend', () => { 
+  state.manualOverride = false; 
+  state.isLocked = false; 
+});
+
+window.addEventListener('mousedown', (e) => { 
+  if (e.target.tagName === 'BUTTON') return;
+  state.manualOverride = true; state.isLocked = true; updateManualTarget(e.clientX, e.clientY); 
+});
+window.addEventListener('mousemove', (e) => { if (state.manualOverride) updateManualTarget(e.clientX, e.clientY); });
+window.addEventListener('mouseup', () => { state.manualOverride = false; state.isLocked = false; });
+
+
+// ============================================================
+// 6. アニメーションループ
+// ============================================================
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const delta = Math.min(clock.getDelta(), 0.1);
+  state.time += delta;
+
+  // 1. 背景オーバーレイ
+  drawBackground();
+
+  // 2. 動体検知（フレームスキップ付き）
+  updateMotionTracking();
+
+  // 3. 照準の滑らかな移動
+  state.currentX += (state.targetX - state.currentX) * 12 * delta;
+  state.currentY += (state.targetY - state.currentY) * 12 * delta;
+
+  // 4. 3Dオブジェクトの更新
+  gridHelper.position.z = (state.time * 5) % 10;
+  targetMesh.rotation.x += delta;
+  targetMesh.rotation.y += delta * 1.5;
+  innerTargetMesh.rotation.x -= delta * 2;
+  innerTargetMesh.rotation.y -= delta;
+
+  const vec = new THREE.Vector3( (state.currentX / window.innerWidth) * 2 - 1, -(state.currentY / window.innerHeight) * 2 + 1, 0.5 );
+  vec.unproject(camera3D);
+  vec.sub(camera3D.position).normalize();
+  const distance = -camera3D.position.z / vec.z; 
+  targetGroup.position.copy(camera3D.position).add(vec.multiplyScalar(distance));
+  
+  if(state.isLocked) {
+    targetMat.color.setHex(0xff0055); gridHelper.material.color.setHex(0x550022);
+  } else {
+    targetMat.color.setHex(0x00ffcc); gridHelper.material.color.setHex(0x003322);
+  }
+
+  composer.render();
+
+  // 5. 2D HUD
+  drawHUD();
+}
+
+animate();
+</script>
+</body>
+</html>
