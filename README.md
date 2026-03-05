@@ -29,4 +29,8 @@ Detects and tracks moving objects in real time via smartphone camera, overlaying
 - Single HTML file — zero dependencies
 
 ## Author
-[wory-bonbon](https://github.com/wory-bonbon)
+[wory-bonbon](https://github.com/wory-bonbon)  
+Built with Gemini 3.1 Pro & Claude Opus 4.6
+
+## License
+MIT License — feel free to use, modify, and distribute.
