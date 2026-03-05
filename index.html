@@ -282,11 +282,11 @@ function updateMotionTracking() {
       const diff = (rDiff + gDiff + bDiff) / 3;
       
       /*
-       * 【修正】閾値を 35 → 45 に引き上げ。
-       * ライブカメラはセンサーノイズ・自動露出の変動で
-       * 常に微小な差分が出る。35だと誤検知が多い。
+       * 【修正】閾値を 45 → 25 に引き上げ。
+       * 近距離（1〜3m）の動体検知に最適化。
+       * 遠距離対応は別バージョンで対応予定。
        */
-      if (diff > 45) { 
+      if (diff > 25) { 
         const pixelIndex = i / 4;
         const x = pixelIndex % MOTION_RES;
         const y = Math.floor(pixelIndex / MOTION_RES);
@@ -552,7 +552,7 @@ function animate() {
   updateMotionTracking();
 
   // 3. 照準の滑らかな移動 — ロック時は高速追従、サーチ時はゆっくり巡回
-  const trackSpeed = state.isLocked ? 25 : 10; // v2: メリハリ追従
+  const trackSpeed = state.isLocked ? 40 : 10; // v2: メリハリ追従
   state.currentX += (state.targetX - state.currentX) * trackSpeed * delta;
   state.currentY += (state.targetY - state.currentY) * trackSpeed * delta;
 
