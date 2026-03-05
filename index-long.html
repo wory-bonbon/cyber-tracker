@@ -1,0 +1,911 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Cyber-Tracker HUD — LONG RANGE</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body, canvas, div {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+    touch-action: none;
+  }
+
+  body {
+    background: #000;
+    overflow: hidden;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    color: #00ffcc;
+  }
+
+  #camera-video {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw; height: 100vh;
+    object-fit: cover;
+    z-index: 0;
+    pointer-events: none;
+  }
+
+  #bg-canvas {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw; height: 100vh;
+    z-index: 1;
+    pointer-events: none;
+  }
+
+  #webgl-canvas {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw; height: 100vh;
+    z-index: 2;
+    pointer-events: none;
+    mix-blend-mode: screen;
+  }
+
+  #hud-canvas {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw; height: 100vh;
+    z-index: 3;
+    pointer-events: none;
+  }
+
+  .scanlines {
+    position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+    background: linear-gradient(
+      to bottom,
+      rgba(255,255,255,0), rgba(255,255,255,0) 50%,
+      rgba(0, 200, 255, 0.04) 50%, rgba(0, 200, 255, 0.04)
+    );
+    background-size: 100% 3px;
+    z-index: 10; pointer-events: none; opacity: 0.5;
+  }
+
+  #start-screen {
+    position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+    background: #000; z-index: 100;
+    display: flex; flex-direction: column; justify-content: center; align-items: center;
+    transition: opacity 0.5s ease;
+  }
+  .sys-title {
+    font-size: 1.4rem; letter-spacing: 0.3em; margin-bottom: 8px;
+    text-shadow: 0 0 10px #00ccff; text-align: center;
+    color: #00ccff;
+  }
+  .sys-subtitle {
+    font-size: 0.75rem; opacity: 0.6; letter-spacing: 0.15em;
+    margin-bottom: 30px; text-align: center; color: #00ccff;
+  }
+  #btn-start {
+    padding: 15px 30px; border: 1px solid #00ccff;
+    background: rgba(0, 204, 255, 0.08); color: #00ccff;
+    font-family: inherit; font-size: 1.1rem; cursor: pointer;
+    text-transform: uppercase; letter-spacing: 0.1em;
+    box-shadow: 0 0 20px rgba(0, 204, 255, 0.15);
+  }
+  #btn-start:active { background: rgba(0, 204, 255, 0.3); }
+
+  #mode-indicator {
+    position: fixed; top: 8px; left: 50%; transform: translateX(-50%);
+    z-index: 20; pointer-events: none;
+    font-size: 10px; letter-spacing: 0.2em;
+    color: #00ccff; opacity: 0.7;
+    text-shadow: 0 0 6px rgba(0,204,255,0.5);
+  }
+</style>
+</head>
+<body>
+
+<video id="camera-video" autoplay playsinline webkit-playsinline muted></video>
+
+<canvas id="bg-canvas"></canvas>
+<canvas id="webgl-canvas"></canvas>
+<canvas id="hud-canvas"></canvas>
+<div class="scanlines"></div>
+<div id="mode-indicator">LONG RANGE MODE</div>
+
+<div id="start-screen">
+  <div class="sys-title">OPTICS SYSTEM</div>
+  <div class="sys-subtitle">LONG RANGE — SKY TRACKER</div>
+  <button id="btn-start">ACTIVATE CAMERA</button>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+// ============================================================
+// 1. 基本設定（状態管理）
+// ============================================================
+const state = {
+  targetX: window.innerWidth / 2,
+  targetY: window.innerHeight / 2,
+  currentX: window.innerWidth / 2,
+  currentY: window.innerHeight / 2,
+  // 予測追従用の速度ベクトル
+  velocityX: 0,
+  velocityY: 0,
+  prevTargetX: window.innerWidth / 2,
+  prevTargetY: window.innerHeight / 2,
+  isLocked: false,
+  lockConfidence: 0,      // 検知信頼度（0〜1）
+  manualOverride: false,
+  time: 0,
+  // 遠距離モード固有
+  detectionCount: 0,       // 検知ピクセル数（HUD表示用）
+  signalStrength: 0,       // 信号強度（HUD表示用）
+  trackingAge: 0,          // ロック継続フレーム数
+  lostFrames: 0            // ロスト後フレーム数（慣性追従用）
+};
+
+// ============================================================
+// 2. Webカメラ & 遠距離特化 動体検知
+// ============================================================
+const video = document.getElementById('camera-video');
+const startScreen = document.getElementById('start-screen');
+const btnStart = document.getElementById('btn-start');
+let cameraEnabled = false;
+
+/*
+ * ■ 遠距離版の核心：検知解像度の引き上げ
+ *
+ * 近距離版: 48×48 = 2,304px
+ *   → 画面幅640pxの鳥（〜20px幅）は 48/640*20 ≈ 1.5px に縮小 → 検知不能
+ *
+ * 遠距離版: 128×128 = 16,384px
+ *   → 同じ鳥が 128/640*20 ≈ 4px に → 差分検知可能
+ *
+ * ただし計算コストは約7倍になるため、
+ * フレームスキップ（2フレームに1回）で補償する。
+ */
+const MOTION_RES = 128;
+
+const motionCanvas = document.createElement('canvas');
+const motionCtx = motionCanvas.getContext('2d', { willReadFrequently: true });
+motionCanvas.width = MOTION_RES;
+motionCanvas.height = MOTION_RES;
+
+let lastImageData = null;
+
+/*
+ * ■ 時間的蓄積バッファ（Temporal Accumulation）
+ *
+ * 低閾値では1フレームのノイズで誤検知が多発する。
+ * 直近3フレームの差分マップを蓄積し、
+ * 複数フレームで一貫して動いている領域のみを「本物の動体」と判定する。
+ *
+ * accumBuffer[y * MOTION_RES + x] = 直近3フレームの差分合計値
+ */
+const ACCUM_FRAMES = 3;
+const accumBuffer = new Float32Array(MOTION_RES * MOTION_RES);
+const diffHistory = [];
+for (let i = 0; i < ACCUM_FRAMES; i++) {
+  diffHistory.push(new Float32Array(MOTION_RES * MOTION_RES));
+}
+let diffHistoryIndex = 0;
+
+/*
+ * ■ フレームスキップ
+ * 128×128 の計算コスト対策。2フレームに1回検知。
+ * iOS Safari 60fps基準で実質30fps検知 — 鳥の追従には十分。
+ */
+let motionFrameCounter = 0;
+const MOTION_SKIP_FRAMES = 2;
+
+// カメラ起動
+btnStart.addEventListener('click', () => {
+  btnStart.innerText = "INITIALIZING...";
+
+  /*
+   * ■ 遠距離版：カメラ解像度を上げる
+   * 近距離版は640×480だが、遠距離では解像度が検知精度に直結する。
+   * 1280×720を要求し、取れなければフォールバック。
+   */
+  const videoConstraints = {
+    facingMode: 'environment',
+    width: { ideal: 1280 },
+    height: { ideal: 720 }
+  };
+
+  navigator.mediaDevices.getUserMedia({
+    video: videoConstraints,
+    audio: false
+  }).then(stream => {
+    video.srcObject = stream;
+    video.play().catch(e => console.warn("Auto-play prevented:", e));
+
+    let timeout = setTimeout(() => {
+      clearInterval(checkInterval);
+      btnStart.innerText = "CAMERA TIMEOUT";
+      setTimeout(() => {
+        startScreen.style.opacity = '0';
+        setTimeout(() => startScreen.style.display = 'none', 500);
+      }, 1500);
+    }, 5000);
+
+    let checkInterval = setInterval(() => {
+      if (video.readyState >= 2) {
+        clearInterval(checkInterval);
+        clearTimeout(timeout);
+        cameraEnabled = true;
+        startScreen.style.opacity = '0';
+        setTimeout(() => startScreen.style.display = 'none', 500);
+      }
+    }, 100);
+
+  }).catch(err => {
+    console.warn("背面カメラ失敗。フロントカメラを試します。", err);
+    navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    }).then(stream => {
+      video.srcObject = stream;
+      video.play().catch(e => console.warn(e));
+
+      let timeout = setTimeout(() => {
+        clearInterval(checkInterval);
+        btnStart.innerText = "CAMERA TIMEOUT";
+        setTimeout(() => startScreen.style.display = 'none', 1500);
+      }, 5000);
+
+      let checkInterval = setInterval(() => {
+        if (video.readyState >= 2) {
+          clearInterval(checkInterval);
+          clearTimeout(timeout);
+          cameraEnabled = true;
+          startScreen.style.opacity = '0';
+          setTimeout(() => startScreen.style.display = 'none', 500);
+        }
+      }, 100);
+    }).catch(() => {
+      btnStart.innerText = "CAMERA OFFLINE";
+      setTimeout(() => {
+        startScreen.style.opacity = '0';
+        setTimeout(() => startScreen.style.display = 'none', 500);
+      }, 1500);
+    });
+  });
+});
+
+function getScreenPosFromVideoPos(videoU, videoV) {
+  const videoAspect = video.videoWidth / video.videoHeight;
+  const screenAspect = window.innerWidth / window.innerHeight;
+
+  let drawWidth, drawHeight, drawX, drawY;
+  if (screenAspect > videoAspect) {
+    drawWidth = window.innerWidth;
+    drawHeight = window.innerWidth / videoAspect;
+    drawX = 0;
+    drawY = (window.innerHeight - drawHeight) / 2;
+  } else {
+    drawHeight = window.innerHeight;
+    drawWidth = window.innerHeight * videoAspect;
+    drawX = (window.innerWidth - drawWidth) / 2;
+    drawY = 0;
+  }
+  return {
+    x: drawX + videoU * drawWidth,
+    y: drawY + videoV * drawHeight
+  };
+}
+
+function updateMotionTracking() {
+  if (!cameraEnabled || video.readyState < video.HAVE_CURRENT_DATA) return;
+  if (state.manualOverride) return;
+
+  motionFrameCounter++;
+  if (motionFrameCounter % MOTION_SKIP_FRAMES !== 0) return;
+
+  motionCtx.drawImage(video, 0, 0, MOTION_RES, MOTION_RES);
+  const currentImageData = motionCtx.getImageData(0, 0, MOTION_RES, MOTION_RES);
+  const data = currentImageData.data;
+
+  if (lastImageData) {
+    const lastData = lastImageData.data;
+    const currentDiff = diffHistory[diffHistoryIndex];
+
+    // --- Pass 1: 現フレーム差分を計算 ---
+    for (let i = 0; i < data.length; i += 4) {
+      const pixIdx = i / 4;
+      const rDiff = Math.abs(data[i]     - lastData[i]);
+      const gDiff = Math.abs(data[i + 1] - lastData[i + 1]);
+      const bDiff = Math.abs(data[i + 2] - lastData[i + 2]);
+      const diff = (rDiff + gDiff + bDiff) / 3;
+
+      /*
+       * ■ 遠距離版：閾値を 25 → 8 に引き下げ
+       *
+       * 遠距離の鳥は数ピクセルの微小変化しか生まない。
+       * 閾値8なら、空を横切る小さな影でも捉えられる。
+       * ノイズは時間的蓄積で排除する。
+       */
+      currentDiff[pixIdx] = diff > 8 ? diff : 0;
+    }
+
+    // --- Pass 2: 蓄積バッファ更新（直近N フレームの合算） ---
+    accumBuffer.fill(0);
+    for (let f = 0; f < ACCUM_FRAMES; f++) {
+      const hist = diffHistory[f];
+      for (let p = 0; p < accumBuffer.length; p++) {
+        accumBuffer[p] += hist[p];
+      }
+    }
+
+    diffHistoryIndex = (diffHistoryIndex + 1) % ACCUM_FRAMES;
+
+    // --- Pass 3: 蓄積値で動体領域を特定 ---
+    /*
+     * ■ 蓄積閾値 = 15
+     * 1フレーム差分8のノイズが3フレーム蓄積しても 8*1 = 8（他フレームは0）
+     * 本物の動体は3フレーム連続で差分が出るので 8*3 = 24 → 閾値超え
+     * → ノイズを排除しつつ微小動体を検知できる
+     */
+    const ACCUM_THRESHOLD = 15;
+    let motionX = 0, motionY = 0, motionCount = 0;
+    let maxAccumVal = 0;
+
+    for (let p = 0; p < accumBuffer.length; p++) {
+      if (accumBuffer[p] > ACCUM_THRESHOLD) {
+        const x = p % MOTION_RES;
+        const y = Math.floor(p / MOTION_RES);
+        // 蓄積値で重み付け — 強い差分ほど重心に寄与
+        const weight = accumBuffer[p];
+        motionX += x * weight;
+        motionY += y * weight;
+        motionCount++;
+        if (weight > maxAccumVal) maxAccumVal = weight;
+      }
+    }
+
+    const totalPixels = MOTION_RES * MOTION_RES;
+
+    /*
+     * ■ 遠距離版：検知下限を 15 → 3 に引き下げ
+     *   鳥は128×128上でも3〜10ピクセル程度しか占めない。
+     *
+     * ■ 上限を 0.20 → 0.12 に引き下げ
+     *   風で木が揺れる等の広範囲ノイズを除外するため厳しく。
+     */
+    if (motionCount > 3 && motionCount < totalPixels * 0.12) {
+      // 重み付き重心
+      const totalWeight = (() => {
+        let tw = 0;
+        for (let p = 0; p < accumBuffer.length; p++) {
+          if (accumBuffer[p] > ACCUM_THRESHOLD) tw += accumBuffer[p];
+        }
+        return tw;
+      })();
+
+      const avgX = motionX / totalWeight;
+      const avgY = motionY / totalWeight;
+
+      const videoU = avgX / MOTION_RES;
+      const videoV = avgY / MOTION_RES;
+
+      const { x, y } = getScreenPosFromVideoPos(videoU, videoV);
+
+      // 速度ベクトルを計算（予測追従用）
+      state.velocityX = x - state.prevTargetX;
+      state.velocityY = y - state.prevTargetY;
+      state.prevTargetX = x;
+      state.prevTargetY = y;
+
+      state.targetX = x;
+      state.targetY = y;
+      state.isLocked = true;
+      state.lockConfidence = Math.min(motionCount / 30, 1.0);
+      state.detectionCount = motionCount;
+      state.signalStrength = Math.min(maxAccumVal / 80, 1.0);
+      state.trackingAge++;
+      state.lostFrames = 0;
+    } else {
+      /*
+       * ■ 慣性追従（Inertial Coasting）
+       * ロストしても即座にアンロックせず、
+       * 直前の速度ベクトルで数フレーム追従を継続する。
+       * 鳥が一瞬雲に隠れた場合などに有効。
+       */
+      state.lostFrames++;
+      if (state.lostFrames < 15) {
+        // 慣性で予測位置を更新
+        state.targetX += state.velocityX * 0.85;
+        state.targetY += state.velocityY * 0.85;
+        state.velocityX *= 0.85;
+        state.velocityY *= 0.85;
+        state.lockConfidence *= 0.9;
+        // isLocked維持（薄い表示でCOASTING状態を示す）
+      } else {
+        state.isLocked = false;
+        state.lockConfidence = 0;
+        state.trackingAge = 0;
+        state.detectionCount = 0;
+        state.signalStrength = 0;
+        state.velocityX = 0;
+        state.velocityY = 0;
+      }
+    }
+  }
+  lastImageData = currentImageData;
+}
+
+
+// ============================================================
+// 3. Three.js — 遠距離モードのビジュアル
+// ============================================================
+const webglCanvas = document.getElementById('webgl-canvas');
+const scene = new THREE.Scene();
+
+const camera3D = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+camera3D.position.set(0, 5, 20);
+
+const renderer = new THREE.WebGLRenderer({
+  canvas: webglCanvas, antialias: false,
+  powerPreference: "high-performance", alpha: true
+});
+renderer.setClearColor(0x000000, 0);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+
+// グリッド — 遠距離モードは青系に変更
+const gridHelper = new THREE.GridHelper(200, 100, 0x00ccff, 0x002244);
+gridHelper.position.y = -5;
+scene.add(gridHelper);
+
+const targetGroup = new THREE.Group();
+scene.add(targetGroup);
+
+// ダイヤモンド型レティクル（遠距離の視認性向上）
+const diamondShape = new THREE.BufferGeometry();
+const dSize = 1.8;
+const diamondVerts = new Float32Array([
+   0,  dSize, 0,   dSize, 0, 0,
+   dSize, 0, 0,    0, -dSize, 0,
+   0, -dSize, 0,  -dSize, 0, 0,
+  -dSize, 0, 0,    0,  dSize, 0,
+]);
+diamondShape.setAttribute('position', new THREE.BufferAttribute(diamondVerts, 3));
+const targetMat = new THREE.LineBasicMaterial({ color: 0x00ccff, transparent: true, opacity: 0.9 });
+const diamondMesh = new THREE.LineSegments(diamondShape, targetMat);
+targetGroup.add(diamondMesh);
+
+// 内側の回転リング
+const ringGeo = new THREE.RingGeometry(0.6, 0.8, 6);
+const ringEdges = new THREE.EdgesGeometry(ringGeo);
+const innerRing = new THREE.LineSegments(ringEdges, targetMat);
+targetGroup.add(innerRing);
+
+// 外側のスキャンリング
+const outerRingGeo = new THREE.RingGeometry(2.5, 2.7, 32);
+const outerRingEdges = new THREE.EdgesGeometry(outerRingGeo);
+const outerRingMat = new THREE.LineBasicMaterial({ color: 0x00ccff, transparent: true, opacity: 0.3 });
+const outerRing = new THREE.LineSegments(outerRingEdges, outerRingMat);
+targetGroup.add(outerRing);
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera3D));
+const bloomPass = new UnrealBloomPass(
+  new THREE.Vector2(window.innerWidth, window.innerHeight),
+  1.0, 0.5, 0.15
+);
+composer.addPass(bloomPass);
+
+
+// ============================================================
+// 4. Canvas 2D — 背景 & HUD（遠距離特化表示）
+// ============================================================
+const bgCanvas = document.getElementById('bg-canvas');
+const bgCtx = bgCanvas.getContext('2d', { alpha: true });
+const hudCanvas = document.getElementById('hud-canvas');
+const ctx = hudCanvas.getContext('2d');
+let hudWidth = window.innerWidth;
+let hudHeight = window.innerHeight;
+
+function resizeCanvas() {
+  hudWidth = window.innerWidth;
+  hudHeight = window.innerHeight;
+
+  const dpr = Math.min(window.devicePixelRatio, 2);
+
+  hudCanvas.width = hudWidth * dpr;
+  hudCanvas.height = hudHeight * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  bgCanvas.width = hudWidth * dpr;
+  bgCanvas.height = hudHeight * dpr;
+  bgCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  renderer.setSize(hudWidth, hudHeight);
+  camera3D.aspect = hudWidth / hudHeight;
+  camera3D.updateProjectionMatrix();
+  composer.setSize(hudWidth, hudHeight);
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+function getRandomHex(length) {
+  let result = '';
+  const chars = '0123456789ABCDEF';
+  for (let i = 0; i < length; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
+  return result;
+}
+
+const dataLog = [];
+for (let i = 0; i < 12; i++) dataLog.push(getRandomHex(12));
+
+function drawBackground() {
+  bgCtx.clearRect(0, 0, hudWidth, hudHeight);
+  if (cameraEnabled && video.readyState >= video.HAVE_CURRENT_DATA) {
+    // 遠距離版：オーバーレイを薄くしてカメラ映像の視認性を確保
+    bgCtx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+    bgCtx.fillRect(0, 0, hudWidth, hudHeight);
+  } else {
+    bgCtx.fillStyle = '#000';
+    bgCtx.fillRect(0, 0, hudWidth, hudHeight);
+  }
+}
+
+/*
+ * ■ HUD — 遠距離特化の表示設計
+ *
+ * 近距離版との差分：
+ * - 色調：#00ffcc（緑寄り） → #00ccff（青寄り）でモード区別
+ * - ロック色：#ff0055（赤）→ #ff6600（オレンジ）で視認性向上
+ * - 信号強度ゲージ追加
+ * - 速度ベクトル表示追加
+ * - COASTING状態表示追加
+ * - 接続ラインの距離表示をALT（高度推定）に変更
+ */
+function drawHUD() {
+  ctx.clearRect(0, 0, hudWidth, hudHeight);
+  const cx = state.currentX;
+  const cy = state.currentY;
+
+  const isCoasting = state.isLocked && state.lostFrames > 0;
+  const colorPrimary = state.isLocked
+    ? (isCoasting ? '#ffaa00' : '#ff6600')
+    : '#00ccff';
+  const colorSecondary = state.isLocked
+    ? (isCoasting ? 'rgba(255,170,0,0.3)' : 'rgba(255,102,0,0.3)')
+    : 'rgba(0,204,255,0.3)';
+
+  ctx.strokeStyle = colorPrimary;
+  ctx.fillStyle = colorPrimary;
+  ctx.lineWidth = 1;
+  ctx.font = '10px "SFMono-Regular", Consolas, monospace';
+
+  // 接続ライン（四隅から照準へ）
+  const corners = [
+    { x: 50, y: 50 },
+    { x: hudWidth - 50, y: 50 },
+    { x: 50, y: hudHeight - 50 },
+    { x: hudWidth - 50, y: hudHeight - 50 }
+  ];
+  ctx.beginPath();
+  corners.forEach(c => {
+    ctx.moveTo(c.x, c.y);
+    ctx.lineTo(cx, cy);
+    const midX = (c.x + cx) / 2;
+    const midY = (c.y + cy) / 2;
+    const dist = Math.hypot(cx - c.x, cy - c.y).toFixed(1);
+    ctx.save();
+    ctx.translate(midX, midY);
+    ctx.rotate(Math.atan2(cy - c.y, cx - c.x));
+    ctx.fillText(`RNG:${dist}`, 10, -5);
+    ctx.restore();
+  });
+  ctx.strokeStyle = colorSecondary;
+  ctx.stroke();
+
+  // メインレティクル
+  ctx.strokeStyle = colorPrimary;
+  ctx.lineWidth = 1.5;
+
+  // 外周回転弧（近距離版より大きめ — 遠距離で目立つように）
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(state.time * 1.5);
+  ctx.beginPath();
+  ctx.arc(0, 0, 50, 0, Math.PI * 0.35);
+  ctx.arc(0, 0, 50, Math.PI * 0.65, Math.PI);
+  ctx.arc(0, 0, 50, Math.PI * 1.15, Math.PI * 1.5);
+  ctx.arc(0, 0, 50, Math.PI * 1.65, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+
+  // 内周回転弧
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(-state.time * 2.5);
+  ctx.beginPath();
+  ctx.arc(0, 0, 28, 0, Math.PI * 0.5);
+  ctx.arc(0, 0, 28, Math.PI, Math.PI * 1.5);
+  ctx.stroke();
+  ctx.restore();
+
+  // 十字線（長め — 遠距離視認性）
+  ctx.beginPath();
+  ctx.moveTo(cx - 70, cy); ctx.lineTo(cx - 18, cy);
+  ctx.moveTo(cx + 70, cy); ctx.lineTo(cx + 18, cy);
+  ctx.moveTo(cx, cy - 70); ctx.lineTo(cx, cy - 18);
+  ctx.moveTo(cx, cy + 70); ctx.lineTo(cx, cy + 18);
+  ctx.stroke();
+
+  // 中央ドット
+  ctx.beginPath();
+  ctx.arc(cx, cy, 2.5, 0, Math.PI * 2);
+  ctx.fill();
+
+  // 速度ベクトル表示
+  if (state.isLocked) {
+    const vx = state.velocityX * 3;
+    const vy = state.velocityY * 3;
+    const speed = Math.hypot(vx, vy);
+    if (speed > 2) {
+      ctx.strokeStyle = '#ffaa00';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + vx, cy + vy);
+      // 矢印の先端
+      const angle = Math.atan2(vy, vx);
+      ctx.lineTo(
+        cx + vx - Math.cos(angle - 0.4) * 8,
+        cy + vy - Math.sin(angle - 0.4) * 8
+      );
+      ctx.moveTo(cx + vx, cy + vy);
+      ctx.lineTo(
+        cx + vx - Math.cos(angle + 0.4) * 8,
+        cy + vy - Math.sin(angle + 0.4) * 8
+      );
+      ctx.stroke();
+      ctx.lineWidth = 1;
+    }
+  }
+
+  // 照準横の情報パネル
+  ctx.fillStyle = colorPrimary;
+  ctx.font = '11px monospace';
+  const infoX = cx + 60;
+  ctx.fillText(`TRK-X : ${cx.toFixed(1)}`, infoX, cy - 35);
+  ctx.fillText(`TRK-Y : ${cy.toFixed(1)}`, infoX, cy - 20);
+  ctx.fillText(`AZIMTH: ${(Math.atan2(cy - hudHeight / 2, cx - hudWidth / 2) * 180 / Math.PI).toFixed(1)}°`, infoX, cy - 5);
+
+  const speed = Math.hypot(state.velocityX, state.velocityY).toFixed(1);
+  ctx.fillText(`V-SPD : ${speed} px/f`, infoX, cy + 12);
+
+  if (state.isLocked) {
+    if (isCoasting) {
+      ctx.fillStyle = '#ffaa00';
+      ctx.fillText(`>> COASTING <<`, infoX, cy + 30);
+    } else {
+      ctx.fillStyle = '#ff6600';
+      ctx.fillText(`!! TARGET LOCKED !!`, infoX, cy + 30);
+    }
+    ctx.fillStyle = colorPrimary;
+    ctx.fillText(`CONF: ${(state.lockConfidence * 100).toFixed(0)}%`, infoX, cy + 45);
+    ctx.fillText(`AGE : ${state.trackingAge}f`, infoX, cy + 58);
+  } else {
+    ctx.fillStyle = colorPrimary;
+    ctx.fillText(`STATUS: SCANNING`, infoX, cy + 30);
+  }
+
+  // 固定HUD — 左上
+  ctx.fillStyle = '#00ccff';
+  ctx.font = '13px monospace';
+  ctx.fillText(`SYS.VER 9.6.1 [LONG RANGE]`, 20, 28);
+
+  const camStatus = cameraEnabled ? 'ONLINE (ENV)' : 'OFFLINE (MANUAL)';
+  const motionLabel = state.isLocked
+    ? (isCoasting ? 'COASTING' : 'LOCKED')
+    : 'SCANNING';
+  ctx.font = '12px monospace';
+  ctx.fillText(`OPTIC : ${camStatus}`, 20, 50);
+  ctx.fillText(`MOTION: ${motionLabel}`, 20, 66);
+  ctx.fillText(`DET_PX: ${state.detectionCount}`, 20, 82);
+  ctx.fillText(`RES   : ${MOTION_RES}×${MOTION_RES}`, 20, 98);
+
+  // 信号強度ゲージ（左下）
+  const gaugeX = 20;
+  const gaugeY = hudHeight - 50;
+  const gaugeW = 120;
+  const gaugeH = 8;
+  ctx.strokeStyle = 'rgba(0,204,255,0.4)';
+  ctx.strokeRect(gaugeX, gaugeY, gaugeW, gaugeH);
+  const fillW = gaugeW * state.signalStrength;
+  const gaugeColor = state.signalStrength > 0.6 ? '#ff6600'
+    : state.signalStrength > 0.3 ? '#ffaa00' : '#00ccff';
+  ctx.fillStyle = gaugeColor;
+  ctx.fillRect(gaugeX, gaugeY, fillW, gaugeH);
+  ctx.fillStyle = '#00ccff';
+  ctx.font = '10px monospace';
+  ctx.fillText(`SIGNAL: ${(state.signalStrength * 100).toFixed(0)}%`, gaugeX, gaugeY - 5);
+
+  // 固定HUD — 右上
+  const rightX = hudWidth - 200;
+  ctx.fillStyle = '#00ccff';
+  ctx.font = '12px monospace';
+  ctx.fillText(`V-SYNC : OK`, rightX, 28);
+  ctx.fillText(`MEM_ADR: 0x${getRandomHex(8)}`, rightX, 46);
+  ctx.fillText(`THRESHD: 8 / ACC:${ACCUM_FRAMES}`, rightX, 64);
+  ctx.fillText(`SKIP_FR: ${MOTION_SKIP_FRAMES}`, rightX, 82);
+
+  // データログ（左下寄り）
+  ctx.font = '9px monospace';
+  ctx.fillStyle = 'rgba(0,204,255,0.5)';
+  if (Math.random() > 0.85) { dataLog.shift(); dataLog.push(`SKY_${getRandomHex(3)}: ${getRandomHex(14)}`); }
+  for (let i = 0; i < dataLog.length; i++) {
+    ctx.fillText(dataLog[i], 20, hudHeight - 80 + (i * 11) - dataLog.length * 11);
+  }
+
+  // レーダー（右下）
+  const radarX = hudWidth - 50;
+  const radarY = hudHeight - 50;
+  const radarR = 30;
+  ctx.beginPath();
+  ctx.arc(radarX, radarY, radarR, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(0,204,255,0.3)';
+  ctx.stroke();
+  // スイープライン
+  const sweepAngle = state.time * 4;
+  ctx.beginPath();
+  ctx.moveTo(radarX, radarY);
+  ctx.lineTo(radarX + Math.cos(sweepAngle) * radarR, radarY + Math.sin(sweepAngle) * radarR);
+  ctx.strokeStyle = '#00ccff';
+  ctx.stroke();
+  // ターゲットブリップ
+  if (state.isLocked) {
+    const blipX = radarX + ((state.currentX / hudWidth) - 0.5) * radarR * 2;
+    const blipY = radarY + ((state.currentY / hudHeight) - 0.5) * radarR * 2;
+    ctx.beginPath();
+    ctx.arc(blipX, blipY, 2, 0, Math.PI * 2);
+    ctx.fillStyle = '#ff6600';
+    ctx.fill();
+  }
+}
+
+
+// ============================================================
+// 5. 手動入力ハンドリング
+// ============================================================
+function updateManualTarget(clientX, clientY) {
+  state.targetX = clientX;
+  state.targetY = clientY;
+}
+
+window.addEventListener('touchstart', (e) => {
+  if (e.target.tagName === 'BUTTON') return;
+  e.preventDefault();
+  state.manualOverride = true;
+  state.isLocked = true;
+  state.lockConfidence = 1;
+  updateManualTarget(e.touches[0].clientX, e.touches[0].clientY);
+}, { passive: false });
+
+window.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+  if (state.manualOverride) {
+    updateManualTarget(e.touches[0].clientX, e.touches[0].clientY);
+  }
+}, { passive: false });
+
+window.addEventListener('touchend', () => {
+  state.manualOverride = false;
+  state.isLocked = false;
+  state.lockConfidence = 0;
+});
+
+window.addEventListener('mousedown', (e) => {
+  if (e.target.tagName === 'BUTTON') return;
+  state.manualOverride = true;
+  state.isLocked = true;
+  state.lockConfidence = 1;
+  updateManualTarget(e.clientX, e.clientY);
+});
+window.addEventListener('mousemove', (e) => {
+  if (state.manualOverride) updateManualTarget(e.clientX, e.clientY);
+});
+window.addEventListener('mouseup', () => {
+  state.manualOverride = false;
+  state.isLocked = false;
+  state.lockConfidence = 0;
+});
+
+
+// ============================================================
+// 6. アニメーションループ
+// ============================================================
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const delta = Math.min(clock.getDelta(), 0.1);
+  state.time += delta;
+
+  // 1. 背景
+  drawBackground();
+
+  // 2. 動体検知
+  updateMotionTracking();
+
+  // 3. 照準の追従
+  /*
+   * ■ 遠距離版：予測追従（Predictive Tracking）
+   *
+   * 近距離版: trackSpeed = isLocked ? 40 : 10（単純追従）
+   *
+   * 遠距離版: ロック中は速度ベクトルを加味して
+   * 「次にいるであろう位置」に向けて追従する。
+   * 鳥のような高速移動体に対する遅延を軽減。
+   */
+  let effectiveTargetX = state.targetX;
+  let effectiveTargetY = state.targetY;
+  if (state.isLocked && state.trackingAge > 3) {
+    // 予測量：速度 × 先読みフレーム数（信頼度に応じて調整）
+    const prediction = state.lockConfidence * 2.0;
+    effectiveTargetX += state.velocityX * prediction;
+    effectiveTargetY += state.velocityY * prediction;
+  }
+
+  const trackSpeed = state.isLocked ? 25 : 6;
+  state.currentX += (effectiveTargetX - state.currentX) * trackSpeed * delta;
+  state.currentY += (effectiveTargetY - state.currentY) * trackSpeed * delta;
+
+  // 4. 3Dオブジェクト
+  gridHelper.position.z = (state.time * 3) % 10;
+  diamondMesh.rotation.z += delta * 1.2;
+  innerRing.rotation.z -= delta * 2;
+  outerRing.rotation.z += delta * 0.5;
+
+  // 信頼度に応じて外周リングのサイズを変化
+  const ringScale = 1.0 + (1.0 - state.lockConfidence) * 0.5;
+  outerRing.scale.set(ringScale, ringScale, 1);
+  outerRingMat.opacity = 0.15 + state.lockConfidence * 0.4;
+
+  const vec = new THREE.Vector3(
+    (state.currentX / window.innerWidth) * 2 - 1,
+    -(state.currentY / window.innerHeight) * 2 + 1,
+    0.5
+  );
+  vec.unproject(camera3D);
+  vec.sub(camera3D.position).normalize();
+  const distance = -camera3D.position.z / vec.z;
+  targetGroup.position.copy(camera3D.position).add(vec.multiplyScalar(distance));
+
+  if (state.isLocked) {
+    const isCoasting = state.lostFrames > 0;
+    targetMat.color.setHex(isCoasting ? 0xffaa00 : 0xff6600);
+    outerRingMat.color.setHex(isCoasting ? 0xffaa00 : 0xff6600);
+    gridHelper.material.color.setHex(0x442200);
+  } else {
+    targetMat.color.setHex(0x00ccff);
+    outerRingMat.color.setHex(0x00ccff);
+    gridHelper.material.color.setHex(0x002244);
+  }
+
+  composer.render();
+
+  // 5. 2D HUD
+  drawHUD();
+}
+
+animate();
+</script>
+</body>
+</html>
